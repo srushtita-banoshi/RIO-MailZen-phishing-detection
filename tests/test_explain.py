@@ -1,75 +1,43 @@
-from pathlib import Path
-
-import joblib
-import pandas as pd
-
-from ml.explain import (
-    explain_intent_prediction,
-    explain_phishing_prediction,
-    explain_transition_shift,
-)
+from ml.explain import generate_simple_phishing_explanation
 
 
-def test_explain_phishing_prediction() -> None:
-    root = Path(__file__).resolve().parent.parent
-    package = joblib.load(root / "models/phishing/logistic_regression.joblib")
-
-    metadata = pd.DataFrame([{
-        "url_count": 2,
-        "domain_uses_https": 0,
-        "domain_has_subdomain": 1,
-        "has_attachment": 0,
-        "urgency_indicator_count": 2,
-        "authentication_result": "none",
+def test_generate_simple_phishing_explanation_phish() -> None:
+    features = {
+        "spf_status": "Fail",
+        "dkim_status": "Fail",
+        "urgency_score": 7,
+        "suspicious_keyword_count": 3,
+        "num_links": 2,
         "attachment_type": "none",
-    }])
-
-    exp = explain_phishing_prediction(
-        package=package,
-        subject="Urgent account review",
-        body="Sign in immediately to verify your account.",
-        metadata_df=metadata,
-        prediction_label="phishing",
+    }
+    exp = generate_simple_phishing_explanation(
+        prediction_label="Phishing",
         confidence=0.98,
+        features=features,
+        top_words=["verify", "suspended", "credentials"],
     )
 
-    assert exp["prediction"] == "phishing"
-    assert len(exp["risk_flags"]) >= 1
-    assert len(exp["top_contributing_features"]) >= 1
-    assert "PHISHING" in exp["summary"]
+    assert exp["verdict"] == "PHISHING"
+    assert exp["confidence"] == 0.98
+    assert "PHISHING" in exp["simple_summary"]
+    assert len(exp["evidence_points"]) >= 2
+    assert "verify" in exp["suspicious_terms"]
 
 
-def test_explain_intent_prediction() -> None:
-    root = Path(__file__).resolve().parent.parent
-    package = joblib.load(root / "models/intent/tfidf_logistic_regression.joblib")
-
-    exp = explain_intent_prediction(
-        package=package,
-        text="Could we schedule a planning meeting next week?",
-        predicted_intent="meeting_scheduling",
-        confidence=0.95,
-        action_phrase="schedule a planning meeting",
+def test_generate_simple_phishing_explanation_legit() -> None:
+    features = {
+        "spf_status": "Pass",
+        "dkim_status": "Pass",
+        "urgency_score": 1,
+        "suspicious_keyword_count": 0,
+        "num_links": 0,
+        "attachment_type": "none",
+    }
+    exp = generate_simple_phishing_explanation(
+        prediction_label="Legitimate",
+        confidence=0.99,
+        features=features,
     )
 
-    assert exp["intent"] == "meeting_scheduling"
-    assert exp["action_phrase"] == "schedule a planning meeting"
-    assert "meeting_scheduling" in exp["rationale"]
-
-
-def test_explain_transition_shift() -> None:
-    exp = explain_transition_shift(
-        previous_intent="meeting_scheduling",
-        current_intent="credential_submission",
-        previous_action="schedule meeting",
-        current_action="submit credentials",
-        transition_label="suspicious intent shift",
-        confidence=0.92,
-        rule_baseline="suspicious intent shift",
-        urgency_detected=True,
-        similarity_score=0.08,
-    )
-
-    assert exp["transition_label"] == "suspicious intent shift"
-    assert exp["metrics"]["intent_changed"] is True
-    assert exp["metrics"]["is_sensitive_intent"] is True
-    assert len(exp["details"]) >= 2
+    assert exp["verdict"] == "LEGITIMATE"
+    assert "LEGITIMATE" in exp["simple_summary"]

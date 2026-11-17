@@ -5,3 +5,14 @@ gatherUsageStats = false
 port = 8501
 enableCORS = false
 enableXsrfProtection = false
+
+[client]
+toolbarMode = "minimal"
+
+[theme]
+base = "dark"
+primaryColor = "#6366F1"
+backgroundColor = "#0F1523"
+secondaryBackgroundColor = "#172033"
+textColor = "#F8FAFC"
+font = "sans serif"

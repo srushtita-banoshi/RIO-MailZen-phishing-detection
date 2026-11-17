@@ -8,10 +8,9 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-import pandas as pd
 
 from ml.engine import RIOEngine
-from ml.threads import load_conversation_threads
+from ml.threads import load_sample_threads
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -20,26 +19,24 @@ def benchmark_engine(
     sample_size: int = 100,
     thread_csv: Path | str | None = None,
 ) -> dict[str, Any]:
-    """Run end-to-end performance and latency benchmarks."""
-    print("Initializing RIO Engine...")
+    """Run end-to-end performance and latency benchmarks on the real RIO system."""
+    print("Initializing RIO Engine with real-data models...")
     engine = RIOEngine()
-    engine.load_models()
+    engine.load()
 
-    # 1. Phishing & Intent Real-Time Latency Benchmark
     test_emails = [
-        ("Account Review Required", "Please sign in to verify your account immediately at http://secure.example.com", "Security Desk <alert@domain.com>"),
-        ("Project Meeting", "Could we schedule a planning meeting next Tuesday?", "Alex <alex@company.com>"),
-        ("Invoice Payment", "Please confirm that the invoice payment was received.", "Billing <finance@supplier.org>"),
-        ("Document Access", "Please grant access to the research folder before 5pm.", "Dev <dev@corp.internal>"),
+        ("Critical: Unlock Your Profile Immediately", "Your account access will be terminated within 24 hours. Sign in to http://auth-portal.com to verify credentials.", "Security Desk <alert@auth-portal.com>", "Fail"),
+        ("Project Meeting Planning", "Could we schedule a planning meeting next Tuesday?", "Alex <alex@company.com>", "Pass"),
+        ("Invoice Payment Status", "Please confirm that the invoice payment was received.", "Billing <finance@supplier.org>", "Pass"),
+        ("Document Access Review", "Please grant access to the research folder before 5pm.", "Dev <dev@corp.internal>", "Pass"),
     ]
 
     latencies_ms: list[float] = []
     print(f"Benchmarking real-time inference latency across {sample_size} runs...")
     for i in range(sample_size):
-        subject, body, sender = test_emails[i % len(test_emails)]
-        t0 = time.perf_counter()
-        res = engine.analyze_raw_email(subject=subject, body=body, sender=sender)
-        latencies_ms.append(res["execution_time_ms"])
+        subject, body, sender, spf = test_emails[i % len(test_emails)]
+        res = engine.analyze(subject=subject, body=body, sender=sender, spf_override=spf)
+        latencies_ms.append(res["latency_ms"])
 
     latency_stats = {
         "mean_ms": float(np.mean(latencies_ms)),
@@ -50,17 +47,12 @@ def benchmark_engine(
     }
     print(f"Latency: Mean={latency_stats['mean_ms']:.2f}ms, P95={latency_stats['p95_ms']:.2f}ms")
 
-    # 2. Conversation Thread Dataset Inspection
-    thread_stats: dict[str, Any] = {"status": "skipped"}
+    # Inspect Real Thread Dataset
     target_csv = Path(thread_csv) if thread_csv else (ROOT / "data/raw/email_thread_details.csv")
-    if not target_csv.exists():
-        dl_fallback = Path("C:/Users/LENOVO/Downloads/email_thread_details.csv")
-        if dl_fallback.exists():
-            target_csv = dl_fallback
-
+    thread_stats: dict[str, Any] = {"status": "skipped"}
     if target_csv.exists():
         print(f"Loading conversation thread dataset from {target_csv}...")
-        threads = load_conversation_threads(target_csv, max_threads=100, min_turns=2)
+        threads = load_sample_threads(target_csv, max_threads=50, min_turns=2)
         turn_counts = [t.turn_count for t in threads.values()]
         thread_stats = {
             "status": "loaded",
@@ -78,6 +70,7 @@ def benchmark_engine(
     }
 
     report_path = ROOT / "reports/evaluation_summary.json"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     print(f"Benchmark summary written to {report_path}")
     return summary

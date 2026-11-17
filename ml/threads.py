@@ -1,4 +1,4 @@
-"""Multi-turn conversation thread processing and trajectory analysis for RIO."""
+"""Multi-turn conversation thread processing and intent-shift detection for RIO."""
 
 from __future__ import annotations
 
@@ -9,10 +9,11 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from sklearn.feature_extraction.text import TfidfVectorizer
 
-from ml.explain import explain_transition_shift
-from ml.intent.train import extract_requested_action
-from ml.transition.train import _cosine_similarity, _features, rule_predict
+from ml.intent import SENSITIVE_INTENTS, classify_intent, extract_requested_action
+
+ROOT = Path(__file__).resolve().parent.parent
 
 
 @dataclass
@@ -39,51 +40,49 @@ class ConversationThread:
 
 
 def clean_body_text(raw_text: str) -> str:
-    """Clean quoted-printable artifacts, email headers, and reply blocks from raw email body."""
+    """Clean quoted-printable artifacts and reply block quotes from raw email body."""
     if not isinstance(raw_text, str) or not raw_text.strip():
         return ""
-
-    text = raw_text
-
-    # Decode quoted-printable artifacts common in enterprise email logs like Enron
-    text = text.replace("=20", " ").replace("=09", " ").replace("=\n", "")
+    text = raw_text.replace("=20", " ").replace("=09", " ").replace("=\n", "")
     text = re.sub(r"=([0-9A-Fa-f]{2})", " ", text)
-
-    # Remove forwarded / reply quotation headers
+    # Strip forwarded and original message reply sections
     text = re.sub(
         r"-+\s*(?:Original Message|Forwarded by|Forwarded Message)\s*-+[\s\S]*?(?:Subject:|Date:|To:|From:)[^\n]*\n",
         " ",
         text,
         flags=re.IGNORECASE,
     )
-
-    # Remove standard quoting prefix '>'
     text = re.sub(r"^\s*>.*$", "", text, flags=re.MULTILINE)
-
-    # Collapse excess whitespace
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+    return re.sub(r"\s+", " ", text).strip()
 
 
-def load_conversation_threads(
-    csv_path: Path | str,
-    max_threads: int = 50,
+def calculate_text_similarity(text1: str, text2: str) -> float:
+    """Calculate TF-IDF cosine similarity between two texts."""
+    if not text1.strip() or not text2.strip():
+        return 0.0
+    vec = TfidfVectorizer(ngram_range=(1, 2), lowercase=True)
+    try:
+        tfidf = vec.fit_transform([text1, text2])
+        sim = (tfidf[0] @ tfidf[1].T).toarray()[0, 0]
+        return float(np.clip(sim, 0.0, 1.0))
+    except Exception:
+        return 0.0
+
+
+def load_sample_threads(
+    csv_path: Path | str | None = None,
+    max_threads: int = 30,
     min_turns: int = 2,
-    max_rows_to_scan: int = 15000,
-) -> dict[int | str, ConversationThread]:
-    """
-    Safely load conversation threads from email_thread_details.csv.
-    Groups messages by thread_id and orders each thread chronologically by timestamp.
-    Does NOT invent or assign unverified labels.
-    """
-    path = Path(csv_path)
+    max_rows: int = 10000,
+) -> dict[str, ConversationThread]:
+    """Safely load real multi-turn conversation threads from email_thread_details.csv."""
+    path = Path(csv_path) if csv_path else (ROOT / "data/raw/email_thread_details.csv")
     if not path.exists():
-        raise FileNotFoundError(f"Thread dataset not found at {path}")
+        return {}
 
-    # Read with chunking/limit for responsive loading
     chunks = pd.read_csv(
         path,
-        nrows=max_rows_to_scan,
+        nrows=max_rows,
         usecols=["thread_id", "subject", "timestamp", "from", "to", "body"],
         dtype={"thread_id": str, "subject": str, "timestamp": str, "from": str, "to": str, "body": str},
     )
@@ -91,174 +90,93 @@ def load_conversation_threads(
     chunks["timestamp"] = pd.to_datetime(chunks["timestamp"], errors="coerce")
     chunks = chunks.sort_values(by=["thread_id", "timestamp"]).reset_index(drop=True)
 
-    threads: dict[int | str, ConversationThread] = {}
+    threads: dict[str, ConversationThread] = {}
 
     for thread_id, group in chunks.groupby("thread_id", sort=False):
         if len(group) < min_turns:
             continue
-
         first_subject = str(group["subject"].dropna().iloc[0]) if not group["subject"].dropna().empty else "No Subject"
-        conv_thread = ConversationThread(thread_id=thread_id, subject=first_subject)
+        conv = ConversationThread(thread_id=str(thread_id), subject=first_subject)
 
         for turn_idx, (_, row) in enumerate(group.iterrows()):
-            raw_body = str(row["body"]) if pd.notna(row["body"]) else ""
-            cleaned = clean_body_text(raw_body)
-            # If cleaning left it empty, preserve snippet of raw body
-            if not cleaned and raw_body:
-                cleaned = raw_body[:300].strip()
-
+            raw_b = str(row["body"]) if pd.notna(row["body"]) else ""
+            cleaned_b = clean_body_text(raw_b) or raw_b[:200]
             msg = ConversationMessage(
                 turn_index=turn_idx,
-                thread_id=thread_id,
+                thread_id=str(thread_id),
                 timestamp=str(row["timestamp"]) if pd.notna(row["timestamp"]) else "",
                 sender=str(row["from"]) if pd.notna(row["from"]) else "Unknown",
                 recipient=str(row["to"]) if pd.notna(row["to"]) else "Unknown",
                 subject=str(row["subject"]) if pd.notna(row["subject"]) else "",
-                body=raw_body,
-                cleaned_body=cleaned,
+                body=raw_b,
+                cleaned_body=cleaned_b,
             )
-            conv_thread.messages.append(msg)
+            conv.messages.append(msg)
 
-        threads[thread_id] = conv_thread
+        threads[str(thread_id)] = conv
         if len(threads) >= max_threads:
             break
 
     return threads
 
 
-def analyze_thread_trajectory(
-    thread: ConversationThread,
-    artifacts: dict[str, Any],
-) -> list[dict[str, Any]]:
-    """
-    Analyze intent progression and detect intent-shifts across all turns of a conversation thread.
-    Uses trained models to predict intents and transitions dynamically.
-    """
-    intent_package = artifacts["intent"]
-    transition_package = artifacts["transition"]
-
-    trajectory: list[dict[str, Any]] = []
-
-    for i, msg in enumerate(thread.messages):
-        turn_text = msg.cleaned_body or msg.subject or "No content"
-        # Predict intent for this message
-        features = intent_package["vectorizer"].transform([turn_text])
-        probabilities = intent_package["model"].predict_proba(features)[0]
-        intent_idx = int(np.argmax(probabilities))
-        intent = str(intent_package["model"].classes_[intent_idx])
-        confidence = float(probabilities[intent_idx])
-        action = extract_requested_action(turn_text)
-
-        turn_result: dict[str, Any] = {
-            "turn_index": i,
-            "sender": msg.sender,
-            "timestamp": msg.timestamp,
-            "snippet": turn_text[:140] + ("..." if len(turn_text) > 140 else ""),
-            "intent": intent,
-            "intent_confidence": confidence,
-            "requested_action": action,
-            "transition": None,
-        }
-
-        # If turn > 0, compute transition relative to previous turn
-        if i > 0:
-            prev_turn = trajectory[i - 1]
-            prev_text = thread.messages[i - 1].cleaned_body or thread.messages[i - 1].subject or ""
-            curr_text = turn_text
-
-            record = pd.DataFrame([{
-                "previous_email": prev_text,
-                "current_email": curr_text,
-                "previous_intent": prev_turn["intent"],
-                "current_intent": intent,
-                "previous_requested_action": prev_turn["requested_action"],
-                "current_requested_action": action,
-            }])
-
-            trans_feat, _ = _features(record)
-            scaled = transition_package["scaler"].transform(trans_feat)
-            trans_probs = transition_package["model"].predict_proba(scaled)[0]
-            trans_idx = int(np.argmax(trans_probs))
-            transition_label = str(transition_package["model"].classes_[trans_idx])
-            transition_conf = float(trans_probs[trans_idx])
-            rule_label = str(rule_predict(record)[0])
-
-            sim = float(_cosine_similarity([prev_text], [curr_text])[0])
-            urgency_flag = bool(re.search(r"\b(?:urgent|urgently|immediately|asap|limited)\b", curr_text, re.IGNORECASE))
-
-            explanation = explain_transition_shift(
-                previous_intent=prev_turn["intent"],
-                current_intent=intent,
-                previous_action=prev_turn["requested_action"],
-                current_action=action,
-                transition_label=transition_label,
-                confidence=transition_conf,
-                rule_baseline=rule_label,
-                urgency_detected=urgency_flag,
-                similarity_score=sim,
-            )
-
-            turn_result["transition"] = {
-                "label": transition_label,
-                "confidence": transition_conf,
-                "rule_baseline": rule_label,
-                "similarity_score": sim,
-                "urgency_flag": urgency_flag,
-                "explanation": explanation,
-            }
-
-        trajectory.append(turn_result)
-
-    return trajectory
-
-
-def evaluate_missing_context_on_thread(
-    thread: ConversationThread,
-    artifacts: dict[str, Any],
-    target_turn_idx: int = -1,
+def detect_intent_shift(
+    previous_text: str,
+    current_text: str,
+    urgency_score: float = 1.0,
 ) -> dict[str, Any]:
-    """
-    Evaluate how the missing-context fallback model behaves on a real thread turn
-    under Full History, Partial History, and No History.
-    """
-    if len(thread.messages) < 2:
-        raise ValueError("Thread must contain at least 2 turns for missing context evaluation.")
+    """Detect if an incoming reply represents a suspicious conversation hijack or legitimate change."""
+    prev_intent, prev_conf, prev_action, prev_sensitive = classify_intent(previous_text)
+    curr_intent, curr_conf, curr_action, curr_sensitive = classify_intent(current_text)
 
-    idx = target_turn_idx if target_turn_idx >= 0 else (len(thread.messages) - 1)
-    current_msg = thread.messages[idx]
-    current_text = current_msg.cleaned_body or current_msg.subject or ""
+    similarity = calculate_text_similarity(previous_text, current_text)
+    intent_changed = prev_intent != curr_intent
 
-    prior_texts = [
-        m.cleaned_body or m.subject or ""
-        for m in thread.messages[:idx]
-    ]
-    full_prior = " \n ".join(prior_texts)
-    immediate_prior = prior_texts[-1] if prior_texts else ""
+    # High urgency cues in current message
+    has_urgency = urgency_score >= 4.0 or bool(
+        re.search(r"\b(urgent|urgently|immediately|within 24 hours|action required)\b", current_text, re.IGNORECASE)
+    )
 
-    fallback_models = artifacts["fallback"]
-    results = {}
+    # Core Security Logic:
+    # If the previous conversation was benign, but current reply suddenly demands sensitive action + urgency:
+    is_suspicious = (not prev_sensitive) and curr_sensitive and has_urgency
 
-    for condition in ("full_history", "partial_history", "no_previous_messages"):
-        model_pkg = fallback_models[condition]
-        if condition == "full_history":
-            text = f"{full_prior} [CURRENT] {current_text}"
-        elif condition == "partial_history":
-            text = f"{immediate_prior[-80:]} [CURRENT] {current_text}"
-        else:
-            text = current_text
-
-        feats = model_pkg["vectorizer"].transform([text])
-        probs = model_pkg["model"].predict_proba(feats)[0]
-        max_idx = int(np.argmax(probs))
-        results[condition] = {
-            "prediction": str(model_pkg["model"].classes_[max_idx]),
-            "confidence": float(probs[max_idx]),
-        }
+    if is_suspicious:
+        status = "SUSPICIOUS INTENT SHIFT"
+        risk_level = "HIGH"
+        simple_explanation = (
+            f"Alert: Earlier messages in this thread established a benign topic ('{prev_intent}'), "
+            f"but this message abruptly demanded sensitive action ('{curr_intent}') under urgency pressure. "
+            f"This strongly indicates conversational hijacking or Business Email Compromise (BEC)."
+        )
+    elif intent_changed and curr_sensitive:
+        status = "UNVERIFIED INTENT PIVOT"
+        risk_level = "MEDIUM"
+        simple_explanation = (
+            f"Notice: The conversation topic shifted from '{prev_intent}' to a sensitive request ('{curr_intent}'). "
+            f"Verify the sender's identity through an independent channel before proceeding."
+        )
+    elif intent_changed:
+        status = "LEGITIMATE INTENT CHANGE"
+        risk_level = "LOW"
+        simple_explanation = (
+            f"The conversation naturally changed topics from '{prev_intent}' to '{curr_intent}' "
+            f"without anomalous urgency or sensitive credential/financial demands."
+        )
+    else:
+        status = "NORMAL CONTINUATION"
+        risk_level = "LOW"
+        simple_explanation = f"The email naturally continues the established topic ('{curr_intent}') with high continuity."
 
     return {
-        "thread_id": thread.thread_id,
-        "target_turn_index": idx,
-        "current_sender": current_msg.sender,
-        "current_snippet": current_text[:120],
-        "evaluations": results,
+        "status": status,
+        "risk_level": risk_level,
+        "previous_intent": prev_intent,
+        "current_intent": curr_intent,
+        "previous_action": prev_action or "None",
+        "current_action": curr_action or "None",
+        "is_sensitive_escalation": curr_sensitive and not prev_sensitive,
+        "continuity_similarity": round(similarity, 3),
+        "has_urgency_pressure": has_urgency,
+        "simple_explanation": simple_explanation,
     }

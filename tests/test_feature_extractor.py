@@ -1,9 +1,10 @@
-from ml.phishing.extractor import (
+from ml.extractor import (
+    calculate_urgency_score,
+    count_suspicious_keywords,
     extract_email_features,
     extract_sender_domain,
-    extract_urgency_indicators,
     extract_urls,
-    to_model_metadata_dataframe,
+    to_metadata_dataframe,
 )
 
 
@@ -21,20 +22,27 @@ def test_extract_urls() -> None:
     assert "http://insecure.site.org" in urls
 
 
-def test_extract_urgency_indicators() -> None:
+def test_calculate_urgency_score() -> None:
     text = "This is urgent! Immediate action required within 24 hours."
-    assert extract_urgency_indicators(text) >= 2
+    score = calculate_urgency_score(text)
+    assert score >= 4
 
 
-def test_to_model_metadata_dataframe() -> None:
+def test_count_suspicious_keywords() -> None:
+    text = "Please verify your account credentials or your password will be suspended."
+    count = count_suspicious_keywords(text)
+    assert count >= 3
+
+
+def test_to_metadata_dataframe() -> None:
     extracted = extract_email_features(
         subject="Urgent Security Alert",
         body="Please check attached invoice.pdf and click https://portal.example.com immediately.",
         sender="Security Team <security@corp.example.com>",
     )
-    df = to_model_metadata_dataframe(extracted)
+    df = to_metadata_dataframe(extracted)
     assert len(df) == 1
-    assert df["url_count"].iloc[0] == 1
-    assert df["urgency_indicator_count"].iloc[0] >= 1
-    assert df["has_attachment"].iloc[0] == 1
+    assert df["num_links"].iloc[0] == 1
+    assert df["urgency_score"].iloc[0] >= 3
+    assert df["contains_attachment_bin"].iloc[0] == 1
     assert df["attachment_type"].iloc[0] == "pdf"
